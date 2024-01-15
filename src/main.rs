@@ -1,212 +1,204 @@
 use std::{
-    fs,
     io::{Read, Write},
-    path::Path,
-    process,
+    path,
 };
 
-fn main() {
-    convert_hkx64_to_hkx86().unwrap();
-    convert_hkx86_to_dump().unwrap();
-    convert_dump_to_csv().unwrap();
+use anyhow::Context;
+use clap::Parser;
+
+#[rustfmt::skip]
+#[derive(Parser, Debug)]
+struct Args {
+    #[arg(short, long, default_value = r".\input")]
+    input_dir: path::PathBuf,
+    #[arg(short, long, default_value = r".\output")]
+    output_dir: path::PathBuf,
+
+    #[arg(long, default_value = r".\tmp")]
+    tmp_dir: path::PathBuf,
+
+    #[arg(long, default_value = r"C:\Program Files\Havok\HavokContentTools\hctStandAloneFilterManager.exe")]
+    hct_exe: path::PathBuf,
 }
 
-fn convert_hkx64_to_hkx86() -> anyhow::Result<()> {
-    let hct_path: &Path =
-        Path::new(r"C:\Program Files\Havok\HavokContentTools\hctStandAloneFilterManager.exe");
-    let hco_path = Path::new(r".\resources\hkx64_to_hkx86.hko");
-    let indir_path = Path::new(r".\resources\hkx64files");
-    let outdir_path = Path::new(r".\resources\hkx86files");
-    let tmpfile_path = Path::new(r".\tmp.hkx");
+#[tokio::main()]
+async fn main() -> anyhow::Result<()> {
+    simplelog::SimpleLogger::init(simplelog::LevelFilter::Info, simplelog::Config::default())?;
 
-    if !hct_path.exists() {
-        anyhow::bail!("missing Havok Content Tools {:?}", hct_path);
+    let args = Args::parse();
+
+    let hkx64_dir = args.input_dir;
+    log::debug!("hkx64 dir: {:?}", hkx64_dir);
+
+    let hkx86_dir = args.tmp_dir.join("hkx86");
+    log::debug!("hkx86 dir: {:?}", hkx86_dir);
+
+    let hct_exe = args.hct_exe;
+    log::debug!("hct exe: {:?}", hct_exe);
+
+    let hko_dir = args.tmp_dir.join("hko");
+    log::debug!("hko dir: {:?}", hko_dir);
+
+    let dump_dir = args.tmp_dir.join("dump");
+    log::debug!("dump dir: {:?}", dump_dir);
+
+    let hk_dump_exe = args.tmp_dir.join("hkdump.exe");
+    log::debug!("hk dump exe: {:?}", hk_dump_exe);
+
+    let skeleton_csv = args.output_dir.join("skeleton.csv");
+    log::debug!("skeleton csv: {:?}", skeleton_csv);
+
+    let csv_dir = args.output_dir;
+    log::debug!("csv dir: {:?}", csv_dir);
+
+    // hkx64 to hkx86
+
+    log::info!("hkx64 to hkx86");
+
+    std::fs::create_dir_all(&hkx86_dir)?;
+    std::fs::create_dir_all(&hko_dir)?;
+
+    let mut join_set = tokio::task::JoinSet::new();
+    for entry in std::fs::read_dir(&hkx64_dir)? {
+        if let Ok(entry) = entry {
+            let input_file = entry.path();
+            let output_file = hkx86_dir.join(entry.file_name());
+            let hct_exe = hct_exe.clone();
+            let hko_file = hko_dir.join(entry.file_name()).with_extension("hko");
+
+            let fut = hkx64_to_hkx86(input_file, output_file, hct_exe, hko_file);
+            join_set.spawn(fut);
+        }
     }
+    while let Some(_) = join_set.join_next().await {}
 
-    if !hco_path.exists() {
-        anyhow::bail!("missing hco file {:?}", hco_path);
+    // hkx86 to dump
+
+    log::info!("hkx86 to dump");
+
+    std::fs::create_dir_all(&dump_dir)?;
+
+    let hk_dump = include_bytes!(r"hkdump.exe");
+    std::fs::write(&hk_dump_exe, hk_dump)?;
+
+    let mut join_set = tokio::task::JoinSet::new();
+    for entry in std::fs::read_dir(&hkx86_dir)? {
+        if let Ok(entry) = entry {
+            let input_file = entry.path();
+            let output_file = dump_dir.join(entry.file_name()).with_extension("bin");
+            let hk_dump_exe = hk_dump_exe.clone();
+
+            let fut = hkx86_to_dump(input_file, output_file, hk_dump_exe);
+            join_set.spawn(fut);
+        }
     }
+    while let Some(_) = join_set.join_next().await {}
 
-    if !indir_path.exists() {
-        anyhow::bail!("missing hkx64files {:?}", indir_path);
+    // skeleton to csv
+
+    std::fs::create_dir_all(&csv_dir)?;
+
+    let skeleton = {
+        let bytes = include_bytes!("skeleton.bin");
+        let mut reader = std::io::Cursor::new(bytes);
+        read_skeleton(&mut reader)?
+    };
+
+    skeleton_to_csv(&skeleton, &skeleton_csv).await?;
+
+    // dump to csv
+
+    log::info!("dump to csv");
+
+    let mut join_set = tokio::task::JoinSet::new();
+    for entry in std::fs::read_dir(&dump_dir)? {
+        if let Ok(entry) = entry {
+            let input_file = entry.path();
+            let output_file = csv_dir.join(entry.file_name()).with_extension("csv");
+            let skeleton = skeleton.clone();
+
+            let fut = dump_to_csv(input_file, output_file, skeleton);
+            join_set.spawn(fut);
+        }
     }
+    while let Some(_) = join_set.join_next().await {}
 
-    if !outdir_path.exists() {
-        anyhow::bail!("missing hkx86files {:?}", indir_path);
-    }
+    // cleanup
 
-    println!("convert hkx64 to hkx86");
-    fs::read_dir(indir_path)?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().extension().map_or(false, |ext| ext == "hkx"))
-        .for_each(|entry| {
-            let infile_path = entry.path();
-            let outfile_path = outdir_path.join(entry.file_name());
+    log::info!("clean up tmp dir");
+    std::fs::remove_dir_all(args.tmp_dir)?;
 
-            let result = convert_hkx64_to_hkx86_entry(
-                &hct_path,
-                &hco_path,
-                &infile_path,
-                &outfile_path,
-                &tmpfile_path,
-            );
-
-            if result.is_ok() {
-                println!("{:?} -[CONVERT]-> {:?}", infile_path, outfile_path);
-                return;
-            }
-
-            let result = convert_hkx64_to_hkx86_entry_fallback(&infile_path, &outfile_path);
-
-            if result.is_ok() {
-                println!("{:?} -[COPY]-> x", infile_path);
-                return;
-            }
-
-            println!("{:?} -[FAILED]-> x", infile_path);
-        });
-
-    return Ok(());
+    Ok(())
 }
 
-fn convert_hkx64_to_hkx86_entry(
-    hct_path: &Path,
-    hco_path: &Path,
-    infile_path: &Path,
-    outfile_path: &Path,
-    tmpfile_path: &Path,
+async fn hkx64_to_hkx86(
+    input_file: path::PathBuf,
+    output_file: path::PathBuf,
+    hct_exe: path::PathBuf,
+    hko_file: path::PathBuf,
 ) -> anyhow::Result<()> {
-    process::Command::new(hct_path)
+    let hko_template = include_str!(r"template.hko");
+    let hko_placeholder = output_file
+        .to_str()
+        .with_context(|| format!("non utf8 path {:?}", output_file))?;
+    let hko = hko_template.replace("{}", hko_placeholder);
+    tokio::fs::write(&hko_file, hko).await?;
+
+    let exit_status = tokio::process::Command::new(&hct_exe)
         .arg("-s")
-        .arg(hco_path)
-        .arg(infile_path)
-        .spawn()?
-        .wait()?;
+        .arg(&hko_file)
+        .arg(&input_file)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await?;
 
-    fs::rename(tmpfile_path, outfile_path)?;
+    if !exit_status.success() {
+        tokio::fs::copy(&input_file, &output_file).await?;
+    }
+
+    log::info!("{:?} -[CONVERT]-> {:?}", input_file, output_file);
 
     Ok(())
 }
 
-fn convert_hkx64_to_hkx86_entry_fallback(
-    infile_path: &Path,
-    outfile_path: &Path,
+async fn hkx86_to_dump(
+    input_file: path::PathBuf,
+    output_file: path::PathBuf,
+    hk_dump_exe: path::PathBuf,
 ) -> anyhow::Result<()> {
-    fs::copy(infile_path, outfile_path)?;
-
-    Ok(())
-}
-
-fn convert_hkx86_to_dump() -> anyhow::Result<()> {
-    let hkdump_path: &Path = Path::new(r".\resources\hkdump.exe");
-    let indir_path = Path::new(r".\resources\hkx86files");
-    let outdir_path = Path::new(r".\resources\dumpfiles");
-
-    if !hkdump_path.exists() {
-        anyhow::bail!("missing hkdump {:?}", hkdump_path);
-    }
-
-    if !indir_path.exists() {
-        println!("missing hkx86files");
-    }
-
-    if !outdir_path.exists() {
-        println!("missing dumpfiles");
-        fs::create_dir(outdir_path)?;
-    }
-
-    println!("convert hkx86 to dump");
-    fs::read_dir(indir_path)?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().extension().map_or(false, |ext| ext == "hkx"))
-        .for_each(|entry| {
-            let infile_path = entry.path();
-            let outfile_path =
-                outdir_path.join(entry.path().with_extension("bin").file_name().unwrap());
-
-            let result = convert_hkx86_to_dump_entry(&hkdump_path, &infile_path, &outfile_path);
-
-            if result.is_ok() {
-                println!("{:?} -[CONVERT]-> {:?}", infile_path, outfile_path);
-                return;
-            }
-
-            println!("{:?} -[FAILED]-> x", infile_path);
-        });
-
-    return Ok(());
-}
-
-fn convert_hkx86_to_dump_entry(
-    hkdump_path: &Path,
-    infile_path: &Path,
-    outfile_path: &Path,
-) -> anyhow::Result<()> {
-    process::Command::new(hkdump_path)
+    let exit_status = tokio::process::Command::new(&hk_dump_exe)
         .arg("-o")
-        .arg(outfile_path)
-        .arg(infile_path)
-        .spawn()?
-        .wait()?;
+        .arg(&output_file)
+        .arg(&input_file)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await?;
+
+    if !exit_status.success() {
+        anyhow::bail!("failed to convert from hkx86 to dump");
+    }
+
+    log::info!("{:?} -[CONVERT]-> {:?}", input_file, output_file);
 
     Ok(())
 }
 
-fn convert_dump_to_csv() -> anyhow::Result<()> {
-    let skeleton_path = Path::new(r".\resources\skeleton.bin");
-    let outfile_path = Path::new(r".\resources\csvfiles\skeleton.csv");
-    let indir_path = Path::new(r".\resources\dumpfiles");
-    let outdir_path = Path::new(r".\resources\csvfiles");
+async fn skeleton_to_csv(skeleton: &Skeleton, output_file: &path::Path) -> anyhow::Result<()> {
+    let mut writer = std::fs::File::create(&output_file)?;
 
-    let skeleton = read_skeleton_from_dump(skeleton_path)?;
-    write_csv_from_skeleton(&skeleton, outfile_path)?;
+    for index in 0..skeleton.n_transforms {
+        let name = &skeleton.transform_names[index as usize];
 
-    println!("convert dump to csv");
-    fs::read_dir(indir_path)?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().extension().map_or(false, |ext| ext == "bin"))
-        .for_each(|entry| {
-            let infile_path = entry.path();
-            let outfile_path =
-                outdir_path.join(entry.path().with_extension("csv").file_name().unwrap());
-
-            let result = read_animation_from_dump(&infile_path).and_then(|animation| {
-                write_csv_from_animation(&skeleton, &animation, &outfile_path)
-            });
-
-            if result.is_err() {
-                println!("{:?} -[FAILED]-> x", infile_path);
-                return;
-            }
-
-            println!("{:?} -[CONVERT]-> {:?}", infile_path, outfile_path);
-        });
-
-    Ok(())
-}
-
-fn read_skeleton_from_dump(skeleton_path: &Path) -> anyhow::Result<Skeleton> {
-    println!("load skeleton from dump file");
-    let mut reader = fs::File::open(skeleton_path)?;
-    let skeleton = read_skeleton(&mut reader)?;
-    Ok(skeleton)
-}
-
-fn write_csv_from_skeleton(skeleton: &Skeleton, outfile_path: &Path) -> anyhow::Result<()> {
-    let mut writer = fs::File::create(outfile_path)?;
-
-    for i in 0..skeleton.n_transforms {
-        let name = &skeleton.transform_names[i as usize];
-
-        let parent_index = skeleton.parents[i as usize];
-
+        let parent_index = skeleton.parents[index as usize];
         let parent_name = if parent_index != -1 {
             &skeleton.transform_names[parent_index as usize]
         } else {
             "NULL"
         };
 
-        let transform = get_world_transform_from_skeleton(&skeleton, i);
+        let transform = world_transform_from_skeleton(&skeleton, index);
 
         let row = format!(
             "{},{},{},{},{},{},{},{},{},{}\n",
@@ -228,38 +220,30 @@ fn write_csv_from_skeleton(skeleton: &Skeleton, outfile_path: &Path) -> anyhow::
     Ok(())
 }
 
-fn read_animation_from_dump(infile_path: &Path) -> anyhow::Result<Animation> {
-    println!("load animation from dump file {:?}", infile_path);
-    let mut reader = fs::File::open(infile_path)?;
-    let animation = read_animation(&mut reader)?;
-    Ok(animation)
-}
-
-fn write_csv_from_animation(
-    skeleton: &Skeleton,
-    animation: &Animation,
-    outfile_path: &Path,
+async fn dump_to_csv(
+    input_file: path::PathBuf,
+    output_file: path::PathBuf,
+    mut skeleton: Skeleton,
 ) -> anyhow::Result<()> {
-    let mut writer = fs::File::create(outfile_path)?;
+    let mut reader = std::fs::File::open(&input_file)?;
+    let animation = read_animation(&mut reader)?;
 
-    let mut skeleton = skeleton.clone();
-
-    for f in 0..animation.n_frames {
+    let mut writer = std::fs::File::create(&output_file)?;
+    for frame in 0..animation.n_frames {
         let n_transforms = i32::min(animation.n_transforms, skeleton.n_transforms);
 
-        for i in 0..n_transforms {
-            skeleton.transforms[i as usize] =
-                animation.poses[f as usize].transforms[i as usize].clone();
+        for index in 0..n_transforms {
+            skeleton.transforms[index as usize] =
+                animation.poses[frame as usize].transforms[index as usize];
         }
 
-        for i in 0..n_transforms {
-            let name = &skeleton.transform_names[i as usize];
-
-            let transform = get_world_transform_from_skeleton(&skeleton, i);
+        for index in 0..n_transforms {
+            let name = &skeleton.transform_names[index as usize];
+            let transform = world_transform_from_skeleton(&skeleton, index);
 
             let row = format!(
                 "{},{},{},{},{},{},{},{},{},{}\n",
-                f,
+                frame,
                 name,
                 transform.location.x,
                 transform.location.y,
@@ -275,40 +259,35 @@ fn write_csv_from_animation(
         }
     }
 
+    log::info!("{:?} -[CONVERT]-> {:?}", input_file, output_file);
+
     Ok(())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Copy, Default, Debug)]
 struct Transform {
     location: glam::Vec3,
     rotation: glam::Quat,
     scale: f32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Default, Debug)]
 struct Pose {
     time: f32,
     transforms: Vec<Transform>,
     floats: Vec<f32>,
 }
 
-#[derive(Debug, Clone)]
-struct Annotation {
-    time: f32,
-    text: String,
-}
-
-#[derive(Debug, Clone)]
+#[derive(Clone, Default, Debug)]
 struct Animation {
     n_frames: i32,
     duration: f32,
     n_transforms: i32,
     n_floats: i32,
     poses: Vec<Pose>,
-    annotations: Vec<Annotation>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Default, Debug)]
 struct Skeleton {
     name: String,
     n_transforms: i32,
@@ -344,7 +323,7 @@ fn read_f32<R: Read>(reader: &mut R) -> anyhow::Result<f32> {
     Ok(f32::from_ne_bytes(buf))
 }
 
-fn read_cstring<R: Read>(reader: &mut R) -> anyhow::Result<String> {
+fn read_string<R: Read>(reader: &mut R) -> anyhow::Result<String> {
     let mut buf = [0u8; 1];
     let mut acc = vec![];
     loop {
@@ -359,7 +338,7 @@ fn read_cstring<R: Read>(reader: &mut R) -> anyhow::Result<String> {
     Ok(s)
 }
 
-fn read_hstring<R: Read>(reader: &mut R) -> anyhow::Result<String> {
+fn read_header<R: Read>(reader: &mut R) -> anyhow::Result<String> {
     let mut buf = [0u8; 1];
     let mut acc = vec![];
     loop {
@@ -402,14 +381,17 @@ fn read_transform<R: Read>(reader: &mut R) -> anyhow::Result<Transform> {
 
 fn read_pose<R: Read>(reader: &mut R, n_transforms: i32, n_floats: i32) -> anyhow::Result<Pose> {
     let time = read_f32(reader)?;
+
     let mut transforms = vec![];
     for _ in 0..n_transforms {
         transforms.push(read_transform(reader)?);
     }
+
     let mut floats = vec![];
     for _ in 0..n_floats {
         floats.push(read_f32(reader)?);
     }
+
     Ok(Pose {
         time,
         transforms,
@@ -417,56 +399,43 @@ fn read_pose<R: Read>(reader: &mut R, n_transforms: i32, n_floats: i32) -> anyho
     })
 }
 
-fn read_annotation<R: Read>(reader: &mut R) -> anyhow::Result<Annotation> {
-    let time = read_f32(reader)?;
-    let text = read_cstring(reader)?;
-    Ok(Annotation { time, text })
-}
-
 fn read_animation<R: Read>(reader: &mut R) -> anyhow::Result<Animation> {
-    let header = read_hstring(reader)?;
-    println!("\theader: {}", header);
+    let header = read_header(reader)?;
+    log::debug!("\theader: {}", header);
 
     let version = read_u32(reader)?;
-    println!("\tversion: {}", version);
+    log::debug!("\tversion: {}", version);
+    if version != 0x1000200 {
+        anyhow::bail!("invalid version");
+    }
 
     let n_skeletons = read_i32(reader)?;
-    println!("\tskeleton count: {}", n_skeletons);
-
-    // including no skeleton
+    log::debug!("\tskeleton count: {}", n_skeletons);
+    if n_skeletons != 0 {
+        anyhow::bail!("found skeleton");
+    }
 
     let n_animations = read_i32(reader)?;
-    println!("\tanimation count: {}", n_skeletons);
+    log::debug!("\tanimation count: {}", n_skeletons);
     if n_animations == 0 {
         anyhow::bail!("missing animation");
     }
 
     let n_frames = read_i32(reader)?;
-    println!("\tframe count: {}", n_frames);
+    log::debug!("\tframe count: {}", n_frames);
 
     let duration = read_f32(reader)?;
-    println!("\tduraion secs: {}", duration);
+    log::debug!("\tduraion secs: {}", duration);
 
     let n_transforms = read_i32(reader)?;
-    println!("\ttransform count: {}", n_transforms);
+    log::debug!("\ttransform count: {}", n_transforms);
 
     let n_floats = read_i32(reader)?;
-    println!("\tfloat count: {}", n_floats);
+    log::debug!("\tfloat count: {}", n_floats);
 
     let mut poses = vec![];
     for _ in 0..n_frames {
         poses.push(read_pose(reader, n_transforms, n_floats)?);
-    }
-
-    let n_annotation_tracks = read_i32(reader)?;
-    println!("\tannotation track count: {}", n_floats);
-
-    let n_annotations = read_i32(reader)?;
-    println!("\tannotation count: {}", n_floats);
-
-    let mut annotations = vec![];
-    for _ in 0..n_annotations {
-        annotations.push(read_annotation(reader)?);
     }
 
     Ok(Animation {
@@ -475,25 +444,24 @@ fn read_animation<R: Read>(reader: &mut R) -> anyhow::Result<Animation> {
         n_transforms,
         n_floats,
         poses,
-        annotations,
     })
 }
 
 fn read_skeleton<R: Read>(reader: &mut R) -> anyhow::Result<Skeleton> {
-    let header = read_hstring(reader)?;
-    println!("header: {}", header);
+    let header = read_header(reader)?;
+    log::debug!("header: {}", header);
 
     let version = read_u32(reader)?;
-    println!("\tversion: {}", version);
+    log::debug!("\tversion: {}", version);
 
     let n_skeletons = read_i32(reader)?;
-    println!("\tskeleton count: {}", n_skeletons);
+    log::debug!("\tskeleton count: {}", n_skeletons);
     if n_skeletons == 0 {
-        anyhow::bail!("missing akeleton");
+        anyhow::bail!("missing skeleton");
     }
 
-    let name = read_cstring(reader)?;
-    println!("\tskeleton name: {}", name);
+    let name = read_string(reader)?;
+    log::debug!("\tskeleton name: {}", name);
 
     let n_transforms = read_i32(reader)?;
     let mut parents = vec![];
@@ -504,7 +472,7 @@ fn read_skeleton<R: Read>(reader: &mut R) -> anyhow::Result<Skeleton> {
     let n_transforms = read_i32(reader)?;
     let mut transform_names = vec![];
     for _ in 0..n_transforms {
-        transform_names.push(read_cstring(reader)?);
+        transform_names.push(read_string(reader)?);
     }
 
     let n_transforms = read_i32(reader)?;
@@ -522,13 +490,8 @@ fn read_skeleton<R: Read>(reader: &mut R) -> anyhow::Result<Skeleton> {
     let n_floats = read_i32(reader)?;
     let mut float_names = vec![];
     for _ in 0..n_floats {
-        float_names.push(read_cstring(reader)?);
+        float_names.push(read_string(reader)?);
     }
-
-    let n_animations = read_i32(reader)?;
-    println!("\tanimation count: {}", n_animations);
-
-    // including no animation
 
     Ok(Skeleton {
         name,
@@ -542,10 +505,11 @@ fn read_skeleton<R: Read>(reader: &mut R) -> anyhow::Result<Skeleton> {
     })
 }
 
-fn mul_transform(t1: &Transform, t2: &Transform) -> Transform {
+fn mul_transform(t1: Transform, t2: Transform) -> Transform {
     let location = t1.location + t1.rotation * t2.location * t1.scale;
     let rotation = t1.rotation * t2.rotation;
     let scale = t1.scale * t2.scale;
+
     Transform {
         location,
         rotation,
@@ -553,13 +517,13 @@ fn mul_transform(t1: &Transform, t2: &Transform) -> Transform {
     }
 }
 
-fn get_world_transform_from_skeleton(skeleton: &Skeleton, index: i32) -> Transform {
+fn world_transform_from_skeleton(skeleton: &Skeleton, index: i32) -> Transform {
     let mut transform = skeleton.transforms[index as usize].clone();
-    let mut next = skeleton.parents[index as usize];
+    let mut index = skeleton.parents[index as usize];
 
-    while next != -1 {
-        transform = mul_transform(&skeleton.transforms[next as usize], &transform);
-        next = skeleton.parents[next as usize];
+    while index != -1 {
+        transform = mul_transform(skeleton.transforms[index as usize], transform);
+        index = skeleton.parents[index as usize];
     }
 
     return transform;

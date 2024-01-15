@@ -65,7 +65,7 @@ bpy.context.view_layer.objects.active = obj
 if bpy.ops.object.mode_set.poll():
     bpy.ops.object.mode_set(mode="EDIT")
 
-with open("../resources/csvfiles/skeleton.csv") as f:
+with open("../output/skeleton.csv") as f:
     reader = csv.reader(f)
     
     relations = {}
