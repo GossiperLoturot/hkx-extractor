@@ -8,21 +8,17 @@ This repository provides a way that converts from hkx animation to human readabl
 
 - Havok Content Tools 2010
 
-- Python 3.11
-
-  - numpy
-
-  - quaternionic
-
 - Blender 4.0
 
 # Usage
 
-1. Move animation hkx files to `resources/hkx64files`.
+0. Downloads pre-build binary by release page.
 
-2. Run `main.py` for converting from animation hkx to csv.
+1. Move animation hkx files to `input` directory in the same directory as `hkx-extractor.exe`.
 
-3. Open `blender/main.blend` by blender and run create_armature.py and load_animation.py in blender's script window.
+2. Run `hkx-extractor.exe` for converting from animation hkx to csv.
+
+3. Open `main.blend` by blender and run create_armature.py and load_animation.py in blender's script window.
 
 # Credits
 
