@@ -57,7 +57,7 @@ def set_pose_matrices(obj, matrix_map):
             rec(pbone, None)
 
 
-in_path = pathlib.Path("../output")
+in_path = pathlib.Path("output")
 
 for entry in in_path.iterdir():
     if not entry.name.startswith(".") and entry.name.endswith(".csv") and entry.name != "skeleton.csv":
