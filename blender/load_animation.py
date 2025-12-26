@@ -1,8 +1,17 @@
 import csv
 import pathlib
+import os
 
 import bpy
 import mathutils
+
+
+# Get the directory where this .blend file is saved
+blend_dir = os.path.dirname(bpy.data.filepath)
+if not blend_dir:
+    raise Exception("Please save your .blend file before running this script!")
+
+csv_dir = os.path.join(blend_dir, "output")
 
 
 # https://docs.blender.org/api/current/bpy.types.Bone.html#bpy.types.Bone.convert_local_to_pose
@@ -57,9 +66,7 @@ def set_pose_matrices(obj, matrix_map):
             rec(pbone, None)
 
 
-in_path = pathlib.Path("output")
-
-for entry in in_path.iterdir():
+for entry in pathlib.Path(csv_dir).iterdir():
     if not entry.name.startswith(".") and entry.name.endswith(".csv") and entry.name != "skeleton.csv":
         with open(entry) as f:
             reader = csv.reader(f)

@@ -1,7 +1,15 @@
 import csv
+import os
 
 import bpy
 import mathutils
+
+
+blend_dir = os.path.dirname(bpy.data.filepath)
+if not blend_dir:
+    raise Exception("Please save your .blend file before running this script!")
+
+csv_path = os.path.join(blend_dir, "output", "skeleton.csv")
 
 
 # https://docs.blender.org/api/current/bpy.types.Bone.html#bpy.types.Bone.convert_local_to_pose
@@ -65,7 +73,7 @@ bpy.context.view_layer.objects.active = obj
 if bpy.ops.object.mode_set.poll():
     bpy.ops.object.mode_set(mode="EDIT")
 
-with open("output/skeleton.csv") as f:
+with open(csv_path) as f:
     reader = csv.reader(f)
     
     relations = {}
